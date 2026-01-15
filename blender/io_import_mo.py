@@ -21,6 +21,69 @@ from mathutils import Matrix, Vector
 
 
 # ============================================================================
+# CDF File Format (Car Definition File)
+# ============================================================================
+
+class CdfFile:
+    """Parser for .cdf car definition files.
+    
+    The CDF file contains car physics and wheel position data.
+    First 48 bytes contain 4 wheel positions (12 bytes each = 3 floats XYZ).
+    
+    Wheel order:
+    - 0: Front-Left
+    - 1: Front-Right
+    - 2: Rear-Left
+    - 3: Rear-Right
+    """
+    
+    WHEEL_NAMES = ["wheel_front_left", "wheel_front_right", 
+                   "wheel_rear_left", "wheel_rear_right"]
+    
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.wheel_positions = []
+    
+    def parse(self):
+        """Parse wheel positions from CDF file"""
+        if not os.path.exists(self.filepath):
+            print(f"CDF file not found: {self.filepath}")
+            return False
+        
+        with open(self.filepath, 'rb') as f:
+            data = f.read(48)  # 4 wheels × 3 floats × 4 bytes
+        
+        if len(data) < 48:
+            print(f"CDF file too small: {len(data)} bytes")
+            return False
+        
+        for i in range(4):
+            x, y, z = struct.unpack('<3f', data[i*12:(i+1)*12])
+            self.wheel_positions.append((x, y, z))
+            print(f"  {self.WHEEL_NAMES[i]}: ({x:.3f}, {y:.3f}, {z:.3f})")
+        
+        return True
+    
+    @staticmethod
+    def find_for_mo_file(mo_filepath):
+        """Find .cdf file corresponding to a .mo file"""
+        directory = os.path.dirname(mo_filepath)
+        base_name = os.path.splitext(os.path.basename(mo_filepath))[0]
+        
+        # Try exact match first
+        cdf_path = os.path.join(directory, base_name + ".cdf")
+        if os.path.exists(cdf_path):
+            return cdf_path
+        
+        # Try case-insensitive search
+        for filename in os.listdir(directory):
+            if filename.lower().endswith('.cdf'):
+                return os.path.join(directory, filename)
+        
+        return None
+
+
+# ============================================================================
 # MO File Format Structures
 # ============================================================================
 
@@ -447,13 +510,14 @@ def create_mesh_from_object(mo_file, obj_index, scale=0.15, mirror_x=True):
 
 
 def import_mo_file(context, filepath, scale=0.15, mirror_x=True, 
-                   import_hidden=False, import_textures=True):
+                   import_hidden=False, import_textures=True, import_cdf=True):
     """Main import function"""
     
     print(f"\n{'='*60}")
     print(f"Importing MO file: {filepath}")
     print(f"Scale: {scale}, Mirror X: {mirror_x}")
     print(f"Import hidden: {import_hidden}, Import textures: {import_textures}")
+    print(f"Import CDF (wheels): {import_cdf}")
     print(f"{'='*60}\n")
     
     # Parse the MO file
@@ -471,6 +535,18 @@ def import_mo_file(context, filepath, scale=0.15, mirror_x=True,
     print(f"  Vertices: {len(mo_file.vertices)}")
     print(f"  Textures: {len(mo_file.textures)}")
     print(f"  Textured faces entries: {len(mo_file.textured_faces)}")
+    
+    # Try to find and parse CDF file for wheel positions
+    cdf_file = None
+    if import_cdf:
+        cdf_path = CdfFile.find_for_mo_file(filepath)
+        if cdf_path:
+            print(f"\nFound CDF file: {cdf_path}")
+            cdf_file = CdfFile(cdf_path)
+            if not cdf_file.parse():
+                cdf_file = None
+        else:
+            print(f"\nNo CDF file found (wheel positions not available)")
     
     # Debug: print first few vertices
     if mo_file.vertices:
@@ -504,6 +580,8 @@ def import_mo_file(context, filepath, scale=0.15, mirror_x=True,
     # Create meshes for each object
     imported_count = 0
     skipped_count = 0
+    wheel_object = None  # Track the wheel object for cloning
+    
     for obj_idx, obj_meta in enumerate(mo_file.objects):
         # Skip hidden objects unless requested
         if not import_hidden and not obj_meta.should_render():
@@ -527,7 +605,60 @@ def import_mo_file(context, filepath, scale=0.15, mirror_x=True,
             if tex_idx < len(materials):
                 obj.data.materials.append(materials[tex_idx])
         
+        # Track wheel object for later cloning
+        if obj_meta.name.lower() == 'wheel':
+            wheel_object = obj
+        
         imported_count += 1
+    
+    # Clone wheel object to 4 positions if CDF was loaded
+    if cdf_file and wheel_object:
+        print(f"\nCloning wheel to 4 positions from CDF...")
+        
+        # Hide the original centered wheel
+        wheel_object.hide_set(True)
+        wheel_object.hide_render = True
+        wheel_object.name = "wheel_template"
+        
+        for i, (wx, wy, wz) in enumerate(cdf_file.wheel_positions):
+            wheel_name = CdfFile.WHEEL_NAMES[i]
+            
+            # Create a copy of the wheel mesh
+            new_mesh = wheel_object.data.copy()
+            new_mesh.name = wheel_name
+            
+            # Create new object
+            new_wheel = bpy.data.objects.new(wheel_name, new_mesh)
+            context.collection.objects.link(new_wheel)
+            new_wheel.parent = parent_empty
+            
+            # Copy materials
+            for mat in wheel_object.data.materials:
+                new_wheel.data.materials.append(mat)
+            
+            # Convert CDF coordinates to Blender (same as vertex conversion)
+            # Original: Y-up, Z-forward → Blender: Z-up, -Y forward
+            # Note: Ignoring Y (height) from CDF - wheels placed at Z=0
+            bx = wx * scale
+            by = -wz * scale
+            bz = 0.0  # Ignore ride height, place wheels at ground level
+            
+            if mirror_x:
+                bx = -bx
+            
+            new_wheel.location = (bx, by, bz)
+            
+            # Mirror wheels so inside of rim faces the car body (suspension)
+            # Left wheels (negative X in original): mirror to face right
+            # Right wheels (positive X in original): mirror to face left
+            is_left_wheel = wx < 0
+            if is_left_wheel:
+                new_wheel.scale.x = -1.0  # Left wheels: flip to face car center
+            # Right wheels keep default orientation (inside already faces car center)
+            
+            print(f"  {wheel_name}: CDF({wx:.3f}, {wy:.3f}, {wz:.3f}) → Blender({bx:.3f}, {by:.3f}, {bz:.3f}), mirror={is_left_wheel}")
+            
+            imported_count += 1
     
     # Select the parent
     parent_empty.select_set(True)
@@ -537,6 +668,8 @@ def import_mo_file(context, filepath, scale=0.15, mirror_x=True,
     print(f"IMPORT COMPLETE")
     print(f"  Imported: {imported_count} objects")
     print(f"  Skipped (hidden): {skipped_count} objects")
+    if cdf_file and wheel_object:
+        print(f"  Wheels cloned: 4 (from CDF)")
     print(f"{'='*60}\n")
     
     # Frame selected in viewport
@@ -599,6 +732,12 @@ class IMPORT_OT_mo(bpy.types.Operator, ImportHelper):
         default=True,
     )
     
+    import_cdf: BoolProperty(
+        name="Import CDF (Wheel Positions)",
+        description="Load .cdf file and clone wheels to correct positions",
+        default=True,
+    )
+    
     def execute(self, context):
         return import_mo_file(
             context,
@@ -607,6 +746,7 @@ class IMPORT_OT_mo(bpy.types.Operator, ImportHelper):
             mirror_x=self.mirror_x,
             import_hidden=self.import_hidden,
             import_textures=self.import_textures,
+            import_cdf=self.import_cdf,
         )
     
     def draw(self, context):
@@ -619,6 +759,7 @@ class IMPORT_OT_mo(bpy.types.Operator, ImportHelper):
         layout.label(text="Options:")
         layout.prop(self, "import_hidden")
         layout.prop(self, "import_textures")
+        layout.prop(self, "import_cdf")
 
 
 # ============================================================================
@@ -660,7 +801,7 @@ def test_parse_only(filepath):
     return mo_file
 
 
-def test_import(filepath, scale=1.0):
+def test_import(filepath, scale=1.0, import_cdf=True):
     """
     Quick import test with default scale of 1.0 for debugging.
     Usage in Blender Python Console:
@@ -674,7 +815,8 @@ def test_import(filepath, scale=1.0):
         scale=scale, 
         mirror_x=True,
         import_hidden=True,  # Import everything for debugging
-        import_textures=False  # Skip textures for faster testing
+        import_textures=False,  # Skip textures for faster testing
+        import_cdf=import_cdf,  # Clone wheels from CDF
     )
 
 
