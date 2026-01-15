@@ -88,17 +88,26 @@ class ObjectMeta:
     def should_render(self):
         """Check if object should be rendered based on naming convention
         
-        Hidden object prefixes (with underscore):
-        - b_ = borders/collision geometry
-        - s_ = skybox geometry  
-        - t_ = timer trigger zones
+        Hidden objects (not rendered):
+        - b_*     = invisible border/collision geometry
+        - ts_time = timer start hitbox
+        - tm_time = timer checkpoint hitbox
+        
+        Note: s_* (skybox) objects ARE visible and rendered.
         """
         if not self.name:
             return True
         name_lower = self.name.lower()
-        # Check for specific prefixes with underscore
-        hidden_prefixes = ('b_', 's_', 't_')
-        return not name_lower.startswith(hidden_prefixes)
+        
+        # Check for invisible border prefix
+        if name_lower.startswith('b_'):
+            return False
+        
+        # Check for timer trigger hitboxes
+        if name_lower in ('ts_time', 'tm_time'):
+            return False
+        
+        return True
 
 
 class TexturedFaces:

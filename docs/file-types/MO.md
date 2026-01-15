@@ -21,9 +21,7 @@ All MO files begin with the 8-byte ASCII magic string: `MOFILE00`
 ├─────────────────────────────────────────────────────────────────┤
 │  Textured Faces Table             (objects × textures × 8 bytes)│
 ├─────────────────────────────────────────────────────────────────┤
-│  Vertex Data                      (faces_count × 3 × 48 bytes)  │
-├─────────────────────────────────────────────────────────────────┤
-│  Padding                          (4 bytes)                     │
+│  Vertex Data                      (faces_count × 3 × 44 bytes)  │
 ├─────────────────────────────────────────────────────────────────┤
 │  Texture Metadata Array           (textures_count × 300 bytes)  │
 └─────────────────────────────────────────────────────────────────┘
@@ -122,14 +120,10 @@ Array of `objects_count` entries.
 
 ### Object Naming Conventions
 
-Object names follow special prefixes that indicate their purpose:
+Object names follow specific prefixes and patterns depending on whether the file contains a car or track model. See the dedicated sections below for details:
 
-| Prefix | Description                          | Rendered |
-|--------|--------------------------------------|----------|
-| `b`    | Border/collision geometry            | No       |
-| `s`    | Skybox geometry                      | No       |
-| `t`    | Timer trigger zones                  | No       |
-| other  | Standard visible geometry            | Yes      |
+- [Car Object Naming](#car-object-naming)
+- [Track Object Naming](#track-object-naming)
 
 ---
 
@@ -161,7 +155,7 @@ This table maps which faces of each object use which texture.
 
 ---
 
-## Vertex Data (48 bytes each)
+## Vertex Data (44 bytes each)
 
 Offset: After textured faces table.
 
@@ -209,33 +203,25 @@ Stored as triangle lists: `faces_count × 3` vertices total.
 | 0x24   | 4    | uint32 | Unknown A                       |
 | 0x28   | 4    | uint32 | Unknown B                       |
 
-**Total: 48 bytes (0x30) per vertex**
+**Total: 44 bytes (0x2C) per vertex**
 
 ### Vertex Layout Summary
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│  Vertex (48 bytes)                                             │
+│  Vertex (44 bytes)                                             │
 ├────────────┬────────────┬────────────┬────────────────────────┤
 │  Position  │   Normal   │   Flags    │   UV + Unknown         │
 │  X, Y, Z   │  NX,NY,NZ  │  (uint32)  │   U, V, _a, _b         │
-│  12 bytes  │  12 bytes  │  4 bytes   │   20 bytes             │
+│  12 bytes  │  12 bytes  │  4 bytes   │   16 bytes             │
 └────────────┴────────────┴────────────┴────────────────────────┘
 ```
 
 ---
 
-## Padding (4 bytes)
-
-Offset: After vertex data.
-
-4 bytes of padding/alignment before texture metadata.
-
----
-
 ## Texture Metadata (300 bytes each)
 
-Offset: After padding.
+Offset: After vertex data.
 
 Array of `textures_count` entries.
 
@@ -243,11 +229,13 @@ Array of `textures_count` entries.
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Unknown (uint32)                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                                                               |
 +                                                               +
 |                                                               |
 +                                                               +
-~                   Texture File Path (300 bytes)               ~
+~                   Texture File Path (296 bytes)               ~
 ~                     Null-terminated ASCII                     ~
 |                                                               |
 +                                                               +
@@ -257,7 +245,8 @@ Array of `textures_count` entries.
 
 | Offset | Size | Type      | Description                       |
 |--------|------|-----------|-----------------------------------|
-| 0x00   | 300  | char[300] | Texture file path (null-term)     |
+| 0x00   | 4    | uint32    | Unknown (always 0 in observed files) |
+| 0x04   | 296  | char[296] | Texture file path (null-term)     |
 
 **Total: 300 bytes (0x12C) per texture**
 
@@ -278,12 +267,9 @@ TEXTURED_FACES_OFFSET = OBJECTS_OFFSET + OBJECTS_SIZE
 TEXTURED_FACES_SIZE   = objects_count × textures_count × 8
 
 VERTICES_OFFSET       = TEXTURED_FACES_OFFSET + TEXTURED_FACES_SIZE
-VERTICES_SIZE         = faces_count × 3 × 48
+VERTICES_SIZE         = faces_count × 3 × 44
 
-PADDING_OFFSET        = VERTICES_OFFSET + VERTICES_SIZE
-PADDING_SIZE          = 4
-
-TEXTURES_OFFSET       = PADDING_OFFSET + PADDING_SIZE
+TEXTURES_OFFSET       = VERTICES_OFFSET + VERTICES_SIZE
 TEXTURES_SIZE         = textures_count × 300
 ```
 
@@ -316,14 +302,11 @@ fread(objects, 160, header.objects_count, file);
 MoTexturedFaces tf[header.objects_count * header.textures_count];
 fread(tf, 8, header.objects_count * header.textures_count, file);
 
-// 4. Read all vertices
+// 4. Read all vertices (44 bytes each)
 MoVertex vertices[header.faces_count * 3];
-fread(vertices, 48, header.faces_count * 3, file);
+fread(vertices, 44, header.faces_count * 3, file);
 
-// 5. Skip padding
-fseek(file, 4, SEEK_CUR);
-
-// 6. Read texture paths
+// 5. Read texture metadata
 MoTextureMeta textures[header.textures_count];
 fread(textures, 300, header.textures_count, file);
 ```
@@ -335,6 +318,123 @@ fread(textures, 300, header.textures_count, file);
 - Geometry is stored as **triangle lists** (not strips or fans)
 - Each face consists of exactly 3 vertices
 - Objects reference vertices via an offset into the global vertex array
-- The scale factor commonly used is `0.15` when rendering
 - The model is mirrored in X-axis
-- Object names starting with `b_` (borders), `s_` (skybox), or `t` (timer hitboxes) are typically hidden during rendering
+
+---
+
+## Car Object Naming
+
+Car `.mo` files use specific object names to define different parts of the vehicle. The game engine recognizes these names and applies special rendering or behavior.
+
+### Visible Objects
+
+| Object Name | Description |
+|-------------|-------------|
+| `body` | Main car body mesh. The game applies **reflections** to this object. |
+| `down` | Chassis/undercarriage (Polish: "podwozie"). Rendered **without reflections**. |
+| `wheel` | Wheel mesh. Must be **centered at origin**. The game clones this mesh 4 times and positions each wheel according to the `.cdf` configuration file. |
+| `mirror1`, `mirror2` | Side mirrors. |
+| `matricula_f` | Front number plate plane. The game applies a **custom number plate texture** at runtime. |
+| `matricula_r` | Rear number plate plane. The game applies a **custom number plate texture** at runtime. |
+
+### Light Sprite Positions
+
+These objects define the position and size of light sprites. The mesh geometry determines where the sprite appears and how large it is.
+
+| Prefix | Description |
+|--------|-------------|
+| `ls_*` | **Stop light** (brake light) sprite position and size. Example: `ls_LeftStop`, `ls_RightStop` |
+| `lr_*` | **Reverse light** sprite position and size. Example: `lr_ReverseLight` |
+
+### Example Car Object List
+
+```
+body            → Main body with reflections
+down            → Undercarriage, no reflections
+wheel           → Single wheel (cloned 4×)
+ls_LeftStop     → Left brake light sprite
+ls_RightStop    → Right brake light sprite
+lr_ReverseLight → Reverse light sprite
+mirror1         → Left side mirror
+mirror2         → Right side mirror
+matricula_f     → Front number plate
+matricula_r     → Rear number plate
+```
+
+---
+
+## Track Object Naming
+
+Track `.mo` files use prefixes to categorize terrain, objects, and invisible collision/trigger geometry.
+
+### Ground Objects (Shadow Map Applied)
+
+These objects receive the baked shadow map texture overlay.
+
+| Prefix | Description |
+|--------|-------------|
+| `gg*` | **Grass** ground with collisions. Example: `gg_field`, `gg_park` |
+| `gr*` | **Road** ground with collisions (main driving surface). Example: `gr_main`, `gr_highway` |
+| `gs*` | **Road sides** with collisions — ditches, slopes, curbs. Example: `gs_ditch`, `gs_slope` |
+
+### Background Objects
+
+| Prefix | Description |
+|--------|-------------|
+| `h_*` | **Background terrain** objects (distant hills, horizons). Example: `h_mountains` |
+
+### Other Visible Objects (No Shadow Map)
+
+| Prefix | Description |
+|--------|-------------|
+| `_*` | General visible objects that don't receive shadow maps. Buildings, trees, props, etc. Example: `_house`, `_tree01` |
+
+### Special Objects
+
+| Prefix | Description |
+|--------|-------------|
+| `s_*` | **Skybox** geometry. Moves with the camera to create infinite sky illusion. |
+
+### Invisible Objects (Collision & Triggers)
+
+These objects are **not rendered** but define game logic boundaries.
+
+| Object Name | Description |
+|-------------|-------------|
+| `b_*` | **Invisible borders** — collision walls that prevent the player from leaving the track. Example: `b_wall`, `b_fence` |
+| `ts_time` | **Timer start** hitbox — triggers the race timer to begin when the player enters. |
+| `tm_time` | **Timer checkpoint** hitbox — checkpoint for lap timing. |
+
+### Example Track Object List
+
+```
+gr_main         → Main road surface (collisions, shadows)
+gr_junction     → Road junction
+gs_curb         → Road curb/edge
+gs_ditch        → Ditch beside road
+gg_grass01      → Grass field
+gg_park         → Park grass area
+h_hills         → Background hills
+_building01     → Visible building
+_tree_oak       → Oak tree prop
+_fence          → Visible fence
+s_sky           → Skybox (moves with camera)
+b_border_left   → Invisible left boundary
+b_border_right  → Invisible right boundary
+ts_time         → Start line timer trigger
+tm_time         → Checkpoint timer trigger
+```
+
+### Summary Table
+
+| Category | Prefix/Name | Rendered | Shadow Map | Collisions |
+|----------|-------------|----------|------------|------------|
+| Ground - Grass | `gg*` | ✅ Yes | ✅ Yes | ✅ Yes |
+| Ground - Road | `gr*` | ✅ Yes | ✅ Yes | ✅ Yes |
+| Ground - Sides | `gs*` | ✅ Yes | ✅ Yes | ✅ Yes |
+| Background | `h_*` | ✅ Yes | ❌ No | ❌ No |
+| Props/Objects | `_*` | ✅ Yes | ❌ No | Varies |
+| Skybox | `s_*` | ✅ Yes | ❌ No | ❌ No |
+| Borders | `b_*` | ❌ No | ❌ No | ✅ Yes |
+| Timer Start | `ts_time` | ❌ No | ❌ No | Trigger |
+| Timer Checkpoint | `tm_time` | ❌ No | ❌ No | Trigger |
