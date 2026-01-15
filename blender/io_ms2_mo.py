@@ -91,7 +91,7 @@ MO_MAGIC = b"MOFILE00"
 HEADER_SIZE = 60
 OBJECT_META_SIZE = 160
 TEXTURED_FACES_SIZE = 8
-VERTEX_SIZE = 44  # NOTE: Spec says 48, but actual files use 44 bytes
+VERTEX_SIZE = 44
 TEXTURE_META_SIZE = 300
 
 
@@ -192,7 +192,7 @@ class TexturedFaces:
 class MoVertex:
     """Vertex data (44 bytes per vertex)
     
-    NOTE: The spec incorrectly states 48 bytes. Actual format is 44 bytes:
+    Structure:
     - 3 floats: position (12 bytes)
     - 3 floats: normal (12 bytes)
     - 1 uint32: flags (4 bytes)
@@ -821,6 +821,342 @@ def test_import(filepath, scale=1.0, import_cdf=True):
 
 
 # ============================================================================
+# MO File Exporter
+# ============================================================================
+
+def get_object_hierarchy(parent_obj):
+    """Get parent object and all its children recursively"""
+    objects = []
+    
+    def collect_children(obj):
+        if obj.type == 'MESH' and obj.data:
+            objects.append(obj)
+        for child in obj.children:
+            collect_children(child)
+    
+    # Include parent if it's a mesh
+    if parent_obj.type == 'MESH' and parent_obj.data:
+        objects.append(parent_obj)
+    
+    # Collect all children
+    for child in parent_obj.children:
+        collect_children(child)
+    
+    return objects
+
+
+def collect_textures_from_objects(mesh_objects):
+    """Collect unique texture paths from a list of mesh objects"""
+    textures = []
+    texture_set = set()
+    
+    for obj in mesh_objects:
+        if obj.type != 'MESH':
+            continue
+        for mat_slot in obj.material_slots:
+            if mat_slot.material and mat_slot.material.use_nodes:
+                for node in mat_slot.material.node_tree.nodes:
+                    if node.type == 'TEX_IMAGE' and node.image:
+                        # Get relative path or filename
+                        img_path = node.image.filepath
+                        if img_path.startswith('//'):
+                            img_path = img_path[2:]  # Remove Blender relative prefix
+                        img_name = os.path.basename(img_path) if img_path else node.image.name
+                        
+                        if img_name not in texture_set:
+                            texture_set.add(img_name)
+                            textures.append(img_name)
+    
+    # Ensure at least one texture entry
+    if not textures:
+        textures.append("")
+    
+    return textures
+
+
+def get_object_texture_index(obj, textures):
+    """Get texture index for an object"""
+    if obj.type != 'MESH':
+        return 0
+    
+    for mat_slot in obj.material_slots:
+        if mat_slot.material and mat_slot.material.use_nodes:
+            for node in mat_slot.material.node_tree.nodes:
+                if node.type == 'TEX_IMAGE' and node.image:
+                    img_path = node.image.filepath
+                    if img_path.startswith('//'):
+                        img_path = img_path[2:]
+                    img_name = os.path.basename(img_path) if img_path else node.image.name
+                    
+                    if img_name in textures:
+                        return textures.index(img_name)
+    return 0
+
+
+def export_mo_file(context, filepath, parent_object, scale=1.0, mirror_x=True):
+    """Export a parent object and its children to MO file format"""
+    
+    print(f"\n{'='*60}")
+    print(f"Exporting MO file: {filepath}")
+    print(f"Parent object: {parent_object.name}")
+    print(f"Scale: {scale}, Mirror X: {mirror_x}")
+    print(f"{'='*60}\n")
+    
+    # Collect mesh objects from hierarchy
+    mesh_objects = get_object_hierarchy(parent_object)
+    
+    if not mesh_objects:
+        print("ERROR: No mesh objects in hierarchy")
+        return {'CANCELLED'}
+    
+    print(f"Found {len(mesh_objects)} mesh objects in hierarchy:")
+    for obj in mesh_objects:
+        print(f"  - {obj.name}")
+    
+    # Collect textures
+    textures = collect_textures_from_objects(mesh_objects)
+    print(f"Found {len(textures)} textures: {textures}")
+    
+    # Prepare data structures
+    objects_data = []  # List of (name, vertices, faces, texture_index)
+    all_vertices = []
+    total_faces = 0
+    
+    for obj in mesh_objects:
+        print(f"  Processing: {obj.name}")
+        
+        # Get evaluated mesh (with modifiers applied)
+        depsgraph = context.evaluated_depsgraph_get()
+        obj_eval = obj.evaluated_get(depsgraph)
+        mesh = obj_eval.to_mesh()
+        
+        # Ensure we have triangles
+        import bmesh
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        bmesh.ops.triangulate(bm, faces=bm.faces[:])
+        bm.to_mesh(mesh)
+        bm.free()
+        
+        mesh.calc_loop_triangles()
+        
+        # Get UV layer
+        uv_layer = mesh.uv_layers.active.data if mesh.uv_layers.active else None
+        
+        # Get world matrix for transformation
+        world_matrix = obj.matrix_world
+        
+        # Collect vertices for this object
+        obj_vertices = []
+        vertex_offset = len(all_vertices)
+        
+        for tri in mesh.loop_triangles:
+            for loop_idx in tri.loops:
+                loop = mesh.loops[loop_idx]
+                vert = mesh.vertices[loop.vertex_index]
+                
+                # Get world-space position
+                world_pos = world_matrix @ vert.co
+                
+                # Convert Blender coords (Z-up, -Y forward) to MO coords (Y-up, Z-forward)
+                # Reverse of import: x = x, y = z, z = -y
+                bx, by, bz = world_pos.x, world_pos.y, world_pos.z
+                
+                # Reverse coordinate conversion
+                ox = bx / scale
+                oy = bz / scale  # Blender Z → Original Y
+                oz = -by / scale  # Blender -Y → Original Z
+                
+                if mirror_x:
+                    ox = -ox
+                
+                # Get world-space normal
+                world_normal = world_matrix.to_3x3() @ vert.normal
+                world_normal.normalize()
+                
+                bnx, bny, bnz = world_normal.x, world_normal.y, world_normal.z
+                
+                # Reverse normal conversion
+                onx = bnx
+                ony = bnz
+                onz = -bny
+                
+                if mirror_x:
+                    onx = -onx
+                
+                # Get UV (reverse flip: v_original = 1.0 - v_blender)
+                if uv_layer:
+                    uv = uv_layer[loop_idx].uv
+                    ou, ov = uv.x, 1.0 - uv.y
+                else:
+                    ou, ov = 0.0, 0.0
+                
+                obj_vertices.append({
+                    'position': (ox, oy, oz),
+                    'normal': (onx, ony, onz),
+                    'uv': (ou, ov),
+                    'flags': 0,
+                    'unknown_a': 0,
+                    'unknown_b': 0,
+                })
+        
+        # Clean up evaluated mesh
+        obj_eval.to_mesh_clear()
+        
+        num_faces = len(obj_vertices) // 3
+        
+        # Reverse face winding if mirrored
+        if mirror_x:
+            reversed_verts = []
+            for i in range(0, len(obj_vertices), 3):
+                reversed_verts.append(obj_vertices[i])
+                reversed_verts.append(obj_vertices[i + 2])
+                reversed_verts.append(obj_vertices[i + 1])
+            obj_vertices = reversed_verts
+        
+        texture_idx = get_object_texture_index(obj, textures)
+        
+        objects_data.append({
+            'name': obj.name[:127],  # Max 127 chars + null
+            'vertex_offset': vertex_offset,
+            'faces_count': num_faces,
+            'texture_index': texture_idx,
+            'unknown_floats': [0.0] * 6,
+        })
+        
+        all_vertices.extend(obj_vertices)
+        total_faces += num_faces
+        
+        print(f"    Vertices: {len(obj_vertices)}, Faces: {num_faces}")
+    
+    print(f"\nTotal: {len(objects_data)} objects, {total_faces} faces, {len(all_vertices)} vertices")
+    
+    # Write the MO file
+    with open(filepath, 'wb') as f:
+        # 1. Write header (60 bytes)
+        f.write(MO_MAGIC)  # 8 bytes
+        f.write(struct.pack('<I', len(objects_data)))  # objects_count
+        f.write(struct.pack('<I', total_faces))  # faces_count
+        f.write(struct.pack('<I', len(textures)))  # textures_count
+        f.write(struct.pack('<10I', *([0] * 10)))  # reserved
+        
+        # 2. Write object metadata (160 bytes each)
+        for obj_data in objects_data:
+            # Name (128 bytes, null-terminated)
+            name_bytes = obj_data['name'].encode('latin-1', errors='replace')
+            name_bytes = name_bytes[:127] + b'\x00' * (128 - min(len(name_bytes), 127))
+            f.write(name_bytes)
+            
+            # Vertex offset and faces count
+            f.write(struct.pack('<I', obj_data['vertex_offset']))
+            f.write(struct.pack('<I', obj_data['faces_count']))
+            
+            # Unknown floats (6 × float)
+            f.write(struct.pack('<6f', *obj_data['unknown_floats']))
+        
+        # 3. Write textured faces table (8 bytes per object × texture)
+        for obj_data in objects_data:
+            for tex_idx in range(len(textures)):
+                if tex_idx == obj_data['texture_index']:
+                    f.write(struct.pack('<II', obj_data['vertex_offset'], obj_data['faces_count']))
+                else:
+                    f.write(struct.pack('<II', 0, 0))
+        
+        # 4. Write vertices (44 bytes each)
+        for vert in all_vertices:
+            f.write(struct.pack('<3f', *vert['position']))
+            f.write(struct.pack('<3f', *vert['normal']))
+            f.write(struct.pack('<I', vert['flags']))
+            f.write(struct.pack('<2f', *vert['uv']))
+            f.write(struct.pack('<II', vert['unknown_a'], vert['unknown_b']))
+        
+        # 5. Write texture metadata (300 bytes each)
+        for tex_path in textures:
+            f.write(struct.pack('<I', 0))  # Unknown (always 0)
+            tex_bytes = tex_path.encode('latin-1', errors='replace')
+            tex_bytes = tex_bytes[:295] + b'\x00' * (296 - min(len(tex_bytes), 295))
+            f.write(tex_bytes)
+    
+    print(f"\nExport complete: {filepath}")
+    print(f"File size: {os.path.getsize(filepath)} bytes")
+    
+    return {'FINISHED'}
+
+
+class EXPORT_OT_mo(bpy.types.Operator):
+    """Export a parent object and its children to Maluch Sim 2 MO file"""
+    bl_idname = "export_scene.mo"
+    bl_label = "Export MO"
+    bl_options = {'REGISTER'}
+    
+    filepath: StringProperty(
+        subtype='FILE_PATH',
+    )
+    
+    filename_ext = ".mo"
+    
+    filter_glob: StringProperty(
+        default="*.mo",
+        options={'HIDDEN'},
+        maxlen=255,
+    )
+    
+    parent_object: StringProperty(
+        name="Parent Object",
+        description="Parent object to export (includes all children)",
+    )
+    
+    scale: FloatProperty(
+        name="Scale",
+        description="Scale factor (divide positions by this value)",
+        default=1.0,
+        min=0.001,
+        max=100.0,
+    )
+    
+    mirror_x: BoolProperty(
+        name="Mirror X-Axis",
+        description="Mirror the model along the X-axis",
+        default=True,
+    )
+    
+    def invoke(self, context, event):
+        # Default to active/selected object
+        if context.active_object:
+            self.parent_object = context.active_object.name
+            # Suggest filename based on object name
+            self.filepath = context.active_object.name + ".mo"
+        
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+    
+    def execute(self, context):
+        # Find the parent object
+        parent_obj = bpy.data.objects.get(self.parent_object)
+        if not parent_obj:
+            self.report({'ERROR'}, f"Object '{self.parent_object}' not found")
+            return {'CANCELLED'}
+        
+        return export_mo_file(
+            context,
+            self.filepath,
+            parent_obj,
+            scale=self.scale,
+            mirror_x=self.mirror_x,
+        )
+    
+    def draw(self, context):
+        layout = self.layout
+        
+        # Object selector
+        layout.prop_search(self, "parent_object", bpy.data, "objects")
+        
+        layout.separator()
+        layout.prop(self, "scale")
+        layout.prop(self, "mirror_x")
+
+
+# ============================================================================
 # Registration
 # ============================================================================
 
@@ -828,14 +1164,22 @@ def menu_func_import(self, context):
     self.layout.operator(IMPORT_OT_mo.bl_idname, text="Maluch Sim 2 (.mo)")
 
 
+def menu_func_export(self, context):
+    self.layout.operator(EXPORT_OT_mo.bl_idname, text="Maluch Sim 2 (.mo)")
+
+
 def register():
     bpy.utils.register_class(IMPORT_OT_mo)
+    bpy.utils.register_class(EXPORT_OT_mo)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+    bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
 
 def unregister():
     bpy.utils.unregister_class(IMPORT_OT_mo)
+    bpy.utils.unregister_class(EXPORT_OT_mo)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
 
 
 if __name__ == "__main__":
